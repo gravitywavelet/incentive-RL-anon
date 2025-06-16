@@ -62,7 +62,8 @@ def make_eval_env(beta=0.1, seed=142):
     return thunk
 
 # ============ 3. Training/Eval =============
-def train_and_eval(beta, seed=42, total_timesteps=2_000_000, eval_freq=5_0000, episodes=50, n_envs=8, writer=None):
+# def train_and_eval(beta, seed=42, total_timesteps=10_000, eval_freq=5_000, episodes=50, n_envs=8, writer=None):
+def train_and_eval(beta, seed=42, total_timesteps=10_000, eval_freq=5_000, episodes=50, n_envs=8, writer=None):
     np.random.seed(seed)
     torch.manual_seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -181,7 +182,9 @@ def beta_search(total_rounds=4, betas_per_round=10, seeds=[123,789], top_k=5, wr
         for round_idx in range(total_rounds):
             start_time = datetime.now()
             print(f"\n⏱️ [Seed {seed} | Round {round_idx+1}] Start at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            sampled_betas = list(beta_dist(alpha, beta_param).rvs(betas_per_round) * 0.2)
+            #sampled_betas = list(beta_dist(alpha, beta_param).rvs(betas_per_round) * 0.2)
+            rng = np.random.default_rng(seed * 100 + round_idx)  # 防冲突，可调
+            sampled_betas = list(beta_dist(alpha, beta_param).rvs(betas_per_round, random_state=rng) * 0.2)
             if round_idx == total_rounds - 1:
                 sampled_betas.append(0.0)
                 
@@ -225,7 +228,16 @@ def beta_search(total_rounds=4, betas_per_round=10, seeds=[123,789], top_k=5, wr
             # Update Beta distribution
             df_hist = pd.DataFrame(history, columns=["beta", "score"])
             best_rows = df_hist.sort_values("score", ascending=False).head(top_k)
-            mean_beta = best_rows["beta"].mean()
+            
+            scores = best_rows["score"].to_numpy()
+            betas = best_rows["beta"].to_numpy()
+            
+            if np.sum(scores) > 0:  # early rounds, scores are all zeros
+                mean_beta = np.average(betas, weights=scores)  # weighted average, give better beta with higher weights
+            else:
+                mean_beta = np.mean(betas)
+                print(f"⚠️ [Round {round_idx+1}] All top-{top_k} scores are zero, fallback to unweighted mean_beta: {mean_beta:.5f}")
+           
             
             valid_scores = [s for (b, s) in results if s > 0]
             score_mean = np.mean(valid_scores) if valid_scores else 0.0
