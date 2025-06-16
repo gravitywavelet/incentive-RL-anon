@@ -15,6 +15,15 @@ from datetime import datetime
 from pathlib import Path
 import csv
 
+
+
+def softmax(x):
+    x = np.array(x)
+    x = x - np.max(x)  # for numerical stability
+    e_x = np.exp(x)
+    return e_x / np.sum(e_x)
+
+
 # =========== 1. KL-Reward Wrapper ==============
 class KLRewardWrapper(gym.Wrapper):
     def __init__(self, env, beta=0.1):
@@ -61,9 +70,12 @@ def make_eval_env(beta=0.1, seed=142):
         return env
     return thunk
 
+
+
+
 # ============ 3. Training/Eval =============
 # def train_and_eval(beta, seed=42, total_timesteps=10_000, eval_freq=5_000, episodes=50, n_envs=8, writer=None):
-def train_and_eval(beta, seed=42, total_timesteps=10_000, eval_freq=5_000, episodes=50, n_envs=8, writer=None):
+def train_and_eval(beta, seed=42, total_timesteps=2_000_000, eval_freq=50_000, episodes=50, n_envs=8, writer=None):
     np.random.seed(seed)
     torch.manual_seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -170,7 +182,7 @@ def run_and_save(beta, seed=42, writer=None):
 
 
 
-def beta_search(total_rounds=4, betas_per_round=10, seeds=[123,789], top_k=5, writer=None):
+def beta_search(total_rounds=4, betas_per_round=10, seeds=[42], top_k=5, writer=None):
     all_history = []
     beta_log_records = []
 
@@ -182,14 +194,14 @@ def beta_search(total_rounds=4, betas_per_round=10, seeds=[123,789], top_k=5, wr
         for round_idx in range(total_rounds):
             start_time = datetime.now()
             print(f"\n⏱️ [Seed {seed} | Round {round_idx+1}] Start at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            #sampled_betas = list(beta_dist(alpha, beta_param).rvs(betas_per_round) * 0.2)
+           
             rng = np.random.default_rng(seed * 100 + round_idx)  # 防冲突，可调
             sampled_betas = list(beta_dist(alpha, beta_param).rvs(betas_per_round, random_state=rng) * 0.2)
             if round_idx == total_rounds - 1:
                 sampled_betas.append(0.0)
                 
             sampled_betas = sorted(set(round(b, 5) for b in sampled_betas))  # keep precision to 5 digits
-            mean_beta = np.mean(sampled_betas)
+            mean_beta = np.mean(sampled_betas) # all Betas
             std_beta = np.std(sampled_betas)
 
             print(f"--- Round {round_idx+1} sampling: {sampled_betas} "
@@ -209,6 +221,7 @@ def beta_search(total_rounds=4, betas_per_round=10, seeds=[123,789], top_k=5, wr
                             df = pd.read_csv(matches[0])
                             score = df.iloc[-1].get("success_rate", 0)
                             results.append((b, score))
+                            #results.append((seed, round_idx + 1, b, score))
                         else:
                             print(f"❗ No result file found for beta={b:.5f}, seed={seed}")
                             score = 0
@@ -226,17 +239,18 @@ def beta_search(total_rounds=4, betas_per_round=10, seeds=[123,789], top_k=5, wr
             history.extend(results)
 
             # Update Beta distribution
-            df_hist = pd.DataFrame(history, columns=["beta", "score"])
+            df_hist = pd.DataFrame(history, columns=["seed", "round", "beta", "score"])
             best_rows = df_hist.sort_values("score", ascending=False).head(top_k)
             
             scores = best_rows["score"].to_numpy()
             betas = best_rows["beta"].to_numpy()
             
-            if np.sum(scores) > 0:  # early rounds, scores are all zeros
-                mean_beta = np.average(betas, weights=scores)  # weighted average, give better beta with higher weights
+            if np.sum(scores) > 0:  # in early rounds, most of the scores are zeros
+                score_softmax = sigmoid(np.array(scores))
+                mean_beta_weighted = np.average(betas, weights=score_softmax)  # weighted average, give better beta with higher weights
             else:
-                mean_beta = np.mean(betas)
-                print(f"⚠️ [Round {round_idx+1}] All top-{top_k} scores are zero, fallback to unweighted mean_beta: {mean_beta:.5f}")
+                mean_beta_weighted = np.mean(betas)
+                print(f"⚠️ [Round {round_idx+1}] All top-{top_k} scores are zero, fallback to unweighted mean_beta: {mean_beta_softmax:.5f}")
            
             
             valid_scores = [s for (b, s) in results if s > 0]
@@ -248,13 +262,15 @@ def beta_search(total_rounds=4, betas_per_round=10, seeds=[123,789], top_k=5, wr
             beta_param = max(1, (1 - mean_beta) * s)
             print(f"[Round {round_idx+1}] Update Beta: alpha={alpha:.2f}, beta={beta_param:.2f}, mean_beta={mean_beta:.5f}")
             tag_prefix = f"Seed{seed}/Round{round_idx+1}"
-            writer.add_scalar(f"{tag_prefix}/mean_beta", mean_beta, round_idx)
-            writer.add_scalar(f"{tag_prefix}/std_beta", std_beta, round_idx)
+            writer.add_scalar(f"{tag_prefix}/mean_beta_softmax", mean_beta_softmax, round_idx)
+            writer.add_scalar(f"{tag_prefix}/mean_beta_all", mean_beta, round_idx)
+            writer.add_scalar(f"{tag_prefix}/std_beta_all", std_beta, round_idx)
             writer.add_scalar(f"{tag_prefix}/min_beta", min(sampled_betas), round_idx)
             writer.add_scalar(f"{tag_prefix}/max_beta", max(sampled_betas), round_idx)
             writer.add_scalar(f"{tag_prefix}/score_mean", score_mean, round_idx)
             writer.add_scalar(f"{tag_prefix}/score_std", score_std, round_idx)
             writer.add_histogram(f"{tag_prefix}/beta_distribution", np.array(sampled_betas), round_idx)
+            writer.flush()
             
 
             # 日志记录：每轮 beta 分布采样情况
@@ -262,8 +278,9 @@ def beta_search(total_rounds=4, betas_per_round=10, seeds=[123,789], top_k=5, wr
                 "seed": seed,
                 "round": round_idx + 1,
                 "n_betas": len(sampled_betas),
-                "mean_beta": mean_beta,
-                "std_beta": std_beta,
+                "mean_beta_softmax": mean_beta_softmax,
+                "mean_beta_all": np.mean(sampled_betas),
+                "std_beta_all": np.std(sampled_betas),
                 "min_beta": min(sampled_betas),
                 "max_beta": max(sampled_betas),
                 "score_mean": score_mean,
@@ -272,7 +289,7 @@ def beta_search(total_rounds=4, betas_per_round=10, seeds=[123,789], top_k=5, wr
             }
             beta_log_records.append(record)
 
-            # 写入统一日志文件
+            # 写入统一日志文件 per round
             csv_path = "results/beta_log_summary_all.csv"
             df_curr = pd.DataFrame([record])
             df_curr.to_csv(
@@ -292,7 +309,7 @@ if __name__ == "__main__":
 
     mp.set_start_method("spawn", force=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    logdir = f"results/tb_logs_{ts}"
+    logdir = f"/root/tf-logs/tb_logs_{ts}"
     writer = SummaryWriter(logdir)
     beta_search(writer=writer)
     writer.close()
