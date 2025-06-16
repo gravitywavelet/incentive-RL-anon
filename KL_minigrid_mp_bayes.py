@@ -71,10 +71,8 @@ def make_eval_env(beta=0.1, seed=142):
     return thunk
 
 
-
-
 # ============ 3. Training/Eval =============
-# def train_and_eval(beta, seed=42, total_timesteps=10_000, eval_freq=5_000, episodes=50, n_envs=8, writer=None):
+#def train_and_eval(beta, seed=42, total_timesteps=10_000, eval_freq=5_000, episodes=50, n_envs=8, writer=None):
 def train_and_eval(beta, seed=42, total_timesteps=2_000_000, eval_freq=50_000, episodes=50, n_envs=8, writer=None):
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -155,7 +153,7 @@ def train_and_eval(beta, seed=42, total_timesteps=2_000_000, eval_freq=50_000, e
     model.save(model_save_path)
     return eval_results
 
-def run_and_save(beta, seed=42, writer=None):
+def run_and_save(beta, seed=42, round_idx=0, writer=None):
     import traceback
     try:
         torch.manual_seed(seed)
@@ -168,21 +166,21 @@ def run_and_save(beta, seed=42, writer=None):
         results = train_and_eval(beta, seed, writer=writer)
         score = results[-1]["success_rate"]
         score_percent = score
-        out_path = f"results/eval_beta{beta:.5f}_seed{seed}_sr{score_percent}.csv"
+        out_path = f"results/eval_seed{seed}_round{round_idx+1}_beta{beta:.5f}_sr{score_percent:.1f}.csv"
         pd.DataFrame(results).to_csv(out_path, index=False)
-        print(f"✅ beta={beta:.5f}, seed={seed} saved!")
+        print(f"✅ seed={seed} round={round_idx+1} beta={beta:.5f} saved!")
     except Exception as e:
         print(f"❌ [ERROR] beta={beta:.5f}, seed={seed}, pid={os.getpid()}\nException: {e}", flush=True)
         traceback.print_exc()
         fail_log = f"results/FAILED_beta{beta:.5f}_seed{seed}.log"
         with open(fail_log, "w") as f:
-            f.write(f"beta={beta}, seed={seed}\nException: {e}\n")
+            f.write(f"beta={beta}, seed={seed} round={round_idx+1} \nException: {e}\n")
             import traceback as tb
             f.write(tb.format_exc())
 
 
 
-def beta_search(total_rounds=4, betas_per_round=10, seeds=[42], top_k=5, writer=None):
+def beta_search(total_rounds=2, betas_per_round=10, seeds=[42,43], top_k=5, writer=None):
     all_history = []
     beta_log_records = []
 
@@ -211,26 +209,25 @@ def beta_search(total_rounds=4, betas_per_round=10, seeds=[42], top_k=5, writer=
             results = []
             with mp.Pool(processes=len(sampled_betas)) as pool:
 
-                rets = [pool.apply_async(run_and_save, (b, seed)) for b in sampled_betas]
+                rets = [pool.apply_async(run_and_save, (b, seed, round_idx)) for b in sampled_betas]
                 for (b, r) in zip(sampled_betas, rets):
                     try:
                         r.get(timeout=3600)
                         
-                        matches = list(Path("results").glob(f"eval_beta{b:.5f}_seed{seed}_sr*.csv"))
+                        matches = list(Path("results").glob(f"eval_seed{seed}_round*_beta{b:.5f}_sr*.csv"))
                         if matches:
                             df = pd.read_csv(matches[0])
                             score = df.iloc[-1].get("success_rate", 0)
-                            results.append((b, score))
-                            #results.append((seed, round_idx + 1, b, score))
                         else:
                             print(f"❗ No result file found for beta={b:.5f}, seed={seed}")
                             score = 0
-                            results.append((b, 0))
+                        results.append((seed, round_idx + 1, b, 0))
+ 
 
                     except Exception as e:
                         error_msg = f"⚠️ A worker crashed for beta={b:.5f}, error: {str(e)}"
                         print(error_msg)
-                        results.append((b, 0))
+                        results.append((seed, round_idx + 1, b, 0))
 
                         crash_tag = f"Seed{seed}/Round{round_idx+1}/crash_beta_{b:.5f}"
                         if writer:
@@ -247,13 +244,12 @@ def beta_search(total_rounds=4, betas_per_round=10, seeds=[42], top_k=5, writer=
             
             if np.sum(scores) > 0:  # in early rounds, most of the scores are zeros
                 score_softmax = sigmoid(np.array(scores))
-                mean_beta_weighted = np.average(betas, weights=score_softmax)  # weighted average, give better beta with higher weights
+                mean_beta_softmax = np.average(betas, weights=score_softmax)  # weighted (softmax) average, give better beta with higher weights
             else:
-                mean_beta_weighted = np.mean(betas)
+                mean_beta_softmax = np.mean(betas)
                 print(f"⚠️ [Round {round_idx+1}] All top-{top_k} scores are zero, fallback to unweighted mean_beta: {mean_beta_softmax:.5f}")
            
-            
-            valid_scores = [s for (b, s) in results if s > 0]
+            valid_scores = [s for (_, _, _, s) in results if s > 0]
             score_mean = np.mean(valid_scores) if valid_scores else 0.0
             score_std = np.std(valid_scores) if valid_scores else 0.0
             
@@ -306,10 +302,13 @@ def beta_search(total_rounds=4, betas_per_round=10, seeds=[42], top_k=5, writer=
 
 
 if __name__ == "__main__":
+    
+    total_rounds = 4
+    seeds=[42,43]
 
     mp.set_start_method("spawn", force=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    logdir = f"/root/tf-logs/tb_logs_{ts}"
+    #ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logdir = f"/root/tf-logs"
     writer = SummaryWriter(logdir)
-    beta_search(writer=writer)
+    beta_search(writer=writer, total_rounds=total_rounds, seeds=seeds)
     writer.close()
