@@ -212,7 +212,7 @@ def beta_search(total_rounds=2, betas_per_round=10, seeds=[42,43], top_k=5, writ
                 rets = [pool.apply_async(run_and_save, (b, seed, round_idx)) for b in sampled_betas]
                 for (b, r) in zip(sampled_betas, rets):
                     try:
-                        r.get(timeout=3600)
+                        r.get(timeout=3600*2)
                         
                         matches = list(Path("results").glob(f"eval_seed{seed}_round*_beta{b:.5f}_sr*.csv"))
                         if matches:
@@ -221,7 +221,7 @@ def beta_search(total_rounds=2, betas_per_round=10, seeds=[42,43], top_k=5, writ
                         else:
                             print(f"❗ No result file found for beta={b:.5f}, seed={seed}")
                             score = 0
-                        results.append((seed, round_idx + 1, b, 0))
+                        results.append((seed, round_idx + 1, b, score))   # (42,1,0.012,86.0)
  
 
                     except Exception as e:
@@ -304,7 +304,7 @@ def beta_search(total_rounds=2, betas_per_round=10, seeds=[42,43], top_k=5, writ
 if __name__ == "__main__":
     
     total_rounds = 4
-    seeds=[42,43]
+    seeds=[47]
 
     mp.set_start_method("spawn", force=True)
     #ts = datetime.now().strftime("%Y%m%d_%H%M%S")
