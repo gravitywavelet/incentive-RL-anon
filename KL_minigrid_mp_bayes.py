@@ -14,7 +14,14 @@ from scipy.stats import beta as beta_dist
 from datetime import datetime
 from pathlib import Path
 import csv
+import logging
 
+logging.basicConfig(
+    filename='beta_sampling.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 
 def softmax(x):
@@ -143,10 +150,12 @@ def train_and_eval(beta, seed=42, total_timesteps=2_000_000, eval_freq=50_000, e
             "mean_length": mean_ep_length
         })
         if writer is not None:
-            writer.add_scalar("success_rate", success_rate, timesteps)
-            writer.add_scalar("mean_env_reward", mean_env_reward, timesteps)
-            writer.add_scalar("mean_shaped_reward", mean_total_reward, timesteps)
-            writer.add_scalar("mean_length", mean_ep_length, timesteps)
+            tag_prefix = f"Seed{seed}/Beta{beta:.5f}"
+            writer.add_scalar(f"{tag_prefix}/success_rate", success_rate, timesteps)
+            writer.add_scalar(f"{tag_prefix}/mean_env_reward", mean_env_reward, timesteps)
+            writer.add_scalar(f"{tag_prefix}/mean_shaped_reward", mean_total_reward, timesteps)
+            writer.add_scalar(f"{tag_prefix}/mean_length", mean_ep_length, timesteps)
+
 
         print(f"[β={beta:.5f} | seed={seed} | step {timesteps}] Success: {success_rate:.1f}% | EnvReward: {mean_env_reward:.2f} | ShapedReward: {mean_total_reward:.2f} | Length: {mean_ep_length:.1f}")
     model_save_path = f"saved/ppo_doorkey_beta{beta:.5f}_seed{seed}_final.zip"
@@ -201,9 +210,11 @@ def beta_search(total_rounds=2, betas_per_round=10, seeds=[42,43], top_k=5, writ
             sampled_betas = sorted(set(round(b, 5) for b in sampled_betas))  # keep precision to 5 digits
             mean_beta = np.mean(sampled_betas) # all Betas
             std_beta = np.std(sampled_betas)
-
-            print(f"--- Round {round_idx+1} sampling: {sampled_betas} "
-                  f"(n={len(sampled_betas)}, mean={mean_beta:.5f}, std={std_beta:.5f}) ---")
+            
+            msg = (f"--- Round {round_idx+1} sampling: {sampled_betas} "
+                   f"(n={len(sampled_betas)}, mean={mean_beta:.5f}, std={std_beta:.5f}) ---")
+            print(msg)
+            logging.info(msg)
             
 
             results = []
@@ -212,7 +223,7 @@ def beta_search(total_rounds=2, betas_per_round=10, seeds=[42,43], top_k=5, writ
                 rets = [pool.apply_async(run_and_save, (b, seed, round_idx)) for b in sampled_betas]
                 for (b, r) in zip(sampled_betas, rets):
                     try:
-                        r.get(timeout=3600*2)
+                        r.get(timeout=3600*4)
                         
                         matches = list(Path("results").glob(f"eval_seed{seed}_round*_beta{b:.5f}_sr*.csv"))
                         if matches:
@@ -243,7 +254,7 @@ def beta_search(total_rounds=2, betas_per_round=10, seeds=[42,43], top_k=5, writ
             betas = best_rows["beta"].to_numpy()
             
             if np.sum(scores) > 0:  # in early rounds, most of the scores are zeros
-                score_softmax = sigmoid(np.array(scores))
+                score_softmax = softmax(np.array(scores))
                 mean_beta_softmax = np.average(betas, weights=score_softmax)  # weighted (softmax) average, give better beta with higher weights
             else:
                 mean_beta_softmax = np.mean(betas)
@@ -257,16 +268,16 @@ def beta_search(total_rounds=2, betas_per_round=10, seeds=[42,43], top_k=5, writ
             alpha = max(1, mean_beta * s)
             beta_param = max(1, (1 - mean_beta) * s)
             print(f"[Round {round_idx+1}] Update Beta: alpha={alpha:.2f}, beta={beta_param:.2f}, mean_beta={mean_beta:.5f}")
-            tag_prefix = f"Seed{seed}/Round{round_idx+1}"
-            writer.add_scalar(f"{tag_prefix}/mean_beta_softmax", mean_beta_softmax, round_idx)
-            writer.add_scalar(f"{tag_prefix}/mean_beta_all", mean_beta, round_idx)
-            writer.add_scalar(f"{tag_prefix}/std_beta_all", std_beta, round_idx)
-            writer.add_scalar(f"{tag_prefix}/min_beta", min(sampled_betas), round_idx)
-            writer.add_scalar(f"{tag_prefix}/max_beta", max(sampled_betas), round_idx)
-            writer.add_scalar(f"{tag_prefix}/score_mean", score_mean, round_idx)
-            writer.add_scalar(f"{tag_prefix}/score_std", score_std, round_idx)
-            writer.add_histogram(f"{tag_prefix}/beta_distribution", np.array(sampled_betas), round_idx)
-            writer.flush()
+            # tag_prefix = f"Seed{seed}/Round{round_idx+1}"
+            # writer.add_scalar(f"{tag_prefix}/mean_beta_softmax", mean_beta_softmax, round_idx)
+            # writer.add_scalar(f"{tag_prefix}/mean_beta_all", mean_beta, round_idx)
+            # writer.add_scalar(f"{tag_prefix}/std_beta_all", std_beta, round_idx)
+            # writer.add_scalar(f"{tag_prefix}/min_beta", min(sampled_betas), round_idx)
+            # writer.add_scalar(f"{tag_prefix}/max_beta", max(sampled_betas), round_idx)
+            # writer.add_scalar(f"{tag_prefix}/score_mean", score_mean, round_idx)
+            # writer.add_scalar(f"{tag_prefix}/score_std", score_std, round_idx)
+            # writer.add_histogram(f"{tag_prefix}/beta_distribution", np.array(sampled_betas), round_idx)
+            # writer.flush()
             
 
             # 日志记录：每轮 beta 分布采样情况
@@ -274,6 +285,8 @@ def beta_search(total_rounds=2, betas_per_round=10, seeds=[42,43], top_k=5, writ
                 "seed": seed,
                 "round": round_idx + 1,
                 "n_betas": len(sampled_betas),
+                "alpha":alpha,
+                "beta_param":beta_param,
                 "mean_beta_softmax": mean_beta_softmax,
                 "mean_beta_all": np.mean(sampled_betas),
                 "std_beta_all": np.std(sampled_betas),
@@ -304,11 +317,12 @@ def beta_search(total_rounds=2, betas_per_round=10, seeds=[42,43], top_k=5, writ
 if __name__ == "__main__":
     
     total_rounds = 4
-    seeds=[47]
+    seeds=[42,43]
 
     mp.set_start_method("spawn", force=True)
     #ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    logdir = f"/root/tf-logs"
-    writer = SummaryWriter(logdir)
+    root_logdir = f"/root/tf-logs/"
+ 
+    writer = SummaryWriter(root_logdir)
     beta_search(writer=writer, total_rounds=total_rounds, seeds=seeds)
     writer.close()
