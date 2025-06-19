@@ -24,13 +24,6 @@ logging.basicConfig(
 )
 
 
-def softmax(x):
-    x = np.array(x)
-    x = x - np.max(x)  # for numerical stability
-    e_x = np.exp(x)
-    return e_x / np.sum(e_x)
-
-
 # =========== 1. KL-Reward Wrapper ==============
 class KLRewardWrapper(gym.Wrapper):
     def __init__(self, env, beta=0.1):
@@ -189,7 +182,7 @@ def run_and_save(beta, seed=42, round_idx=0, writer=None):
 
 
 
-def beta_search(total_rounds=2, betas_per_round=10, seeds=[42,43], top_k=5, writer=None):
+def beta_search(total_rounds=2, betas_per_round=10, seeds=[42,43], writer=None):
     all_history = []
     beta_log_records = []
 
@@ -205,7 +198,7 @@ def beta_search(total_rounds=2, betas_per_round=10, seeds=[42,43], top_k=5, writ
             rng = np.random.default_rng(seed * 100 + round_idx)  # 防冲突，可调
             sampled_betas = list(beta_dist(alpha, beta_param).rvs(betas_per_round, random_state=rng) * 0.2)
             if round_idx == total_rounds - 1:
-                sampled_betas.append(0.0)
+                sampled_betas.append(0.0)  # baseline
                 
             sampled_betas = sorted(set(round(b, 5) for b in sampled_betas))  # keep precision to 5 digits
             mean_beta = np.mean(sampled_betas) # all Betas
@@ -245,39 +238,36 @@ def beta_search(total_rounds=2, betas_per_round=10, seeds=[42,43], top_k=5, writ
                             writer.add_text(crash_tag, error_msg, round_idx)
             
             history.extend(results)
+            
 
             # Update Beta distribution
             df_hist = pd.DataFrame(history, columns=["seed", "round", "beta", "score"])
-            best_rows = df_hist.sort_values("score", ascending=False).head(top_k)
             
-            scores = best_rows["score"].to_numpy()
-            betas = best_rows["beta"].to_numpy()
+            non_zero_rows = df_hist[df_hist["score"] > 1e-6]
             
-            if np.sum(scores) > 0:  # in early rounds, most of the scores are zeros
-                score_softmax = softmax(np.array(scores))
-                mean_beta_softmax = np.average(betas, weights=score_softmax)  # weighted (softmax) average, give better beta with higher weights
+            scores = non_zero_rows["score"].to_numpy()
+            betas = non_zero_rows["beta"].to_numpy()
+            non_zero_scores_count = len(scores) 
+            zero_scores_count = len(df_hist) - non_zero_scores_count 
+            
+            if non_zero_scores_count > 0:
+                scores_norm = np.clip(scores / 100.0, 0, 1)  # Normalize to [0, 1]
+                
+                alpha_update = scores_norm.sum()
+                beta_update = (1 - scores_norm).sum() + zero_scores_count
+
+                alpha += alpha_update
+                beta_param += beta_update
+
+                mean_beta = alpha / (alpha + beta_param)
+
+                msg = f"✅ [Round {round_idx+1}] Updated Beta({alpha:.2f}, {beta_param:.2f}) → mean β ≈ {mean_beta * 0.2:.5f} | non-zero beta count={non_zero_scores_count}"
+                print(msg)
+                logging.info(msg)
             else:
-                mean_beta_softmax = np.mean(betas)
-                print(f"⚠️ [Round {round_idx+1}] All top-{top_k} scores are zero, fallback to unweighted mean_beta: {mean_beta_softmax:.5f}")
-           
-            valid_scores = [s for (_, _, _, s) in results if s > 0]
-            score_mean = np.mean(valid_scores) if valid_scores else 0.0
-            score_std = np.std(valid_scores) if valid_scores else 0.0
-            
-            s = 5
-            alpha = max(1, mean_beta * s)
-            beta_param = max(1, (1 - mean_beta) * s)
-            print(f"[Round {round_idx+1}] Update Beta: alpha={alpha:.2f}, beta={beta_param:.2f}, mean_beta={mean_beta:.5f}")
-            # tag_prefix = f"Seed{seed}/Round{round_idx+1}"
-            # writer.add_scalar(f"{tag_prefix}/mean_beta_softmax", mean_beta_softmax, round_idx)
-            # writer.add_scalar(f"{tag_prefix}/mean_beta_all", mean_beta, round_idx)
-            # writer.add_scalar(f"{tag_prefix}/std_beta_all", std_beta, round_idx)
-            # writer.add_scalar(f"{tag_prefix}/min_beta", min(sampled_betas), round_idx)
-            # writer.add_scalar(f"{tag_prefix}/max_beta", max(sampled_betas), round_idx)
-            # writer.add_scalar(f"{tag_prefix}/score_mean", score_mean, round_idx)
-            # writer.add_scalar(f"{tag_prefix}/score_std", score_std, round_idx)
-            # writer.add_histogram(f"{tag_prefix}/beta_distribution", np.array(sampled_betas), round_idx)
-            # writer.flush()
+                mean_beta = 0.5 # fallback if no signal
+                print(f"⚠️ [Round {round_idx+1}] All scores are zero, fallback to unweighted mean_beta: {mean_beta:.5f}")
+                
             
 
             # 日志记录：每轮 beta 分布采样情况
@@ -287,13 +277,10 @@ def beta_search(total_rounds=2, betas_per_round=10, seeds=[42,43], top_k=5, writ
                 "n_betas": len(sampled_betas),
                 "alpha":alpha,
                 "beta_param":beta_param,
-                "mean_beta_softmax": mean_beta_softmax,
                 "mean_beta_all": np.mean(sampled_betas),
                 "std_beta_all": np.std(sampled_betas),
                 "min_beta": min(sampled_betas),
                 "max_beta": max(sampled_betas),
-                "score_mean": score_mean,
-                "score_std": score_std,
                 "betas": sampled_betas,
             }
             beta_log_records.append(record)
@@ -317,7 +304,7 @@ def beta_search(total_rounds=2, betas_per_round=10, seeds=[42,43], top_k=5, writ
 if __name__ == "__main__":
     
     total_rounds = 4
-    seeds=[42,43]
+    seeds=[42]
 
     mp.set_start_method("spawn", force=True)
     #ts = datetime.now().strftime("%Y%m%d_%H%M%S")
