@@ -7,6 +7,7 @@ import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
 from minigrid.wrappers import RGBImgObsWrapper, ImgObsWrapper
+from torch.utils.tensorboard import SummaryWriter
 import multiprocessing as mp
 import random
 from scipy.stats import beta as beta_dist
@@ -21,12 +22,6 @@ logging.basicConfig(
     format='%(asctime)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
-
-TOTAL_TIMESTEPS = 2_000_000
-EVAL_FREQ       = 50_000
-EVAL_EPISODES   = 100
-N_ENVS          = 8
-SCORE_THRESH    = 0.5
 
 
 # =========== 1. KL-Reward Wrapper ==============
@@ -77,7 +72,8 @@ def make_eval_env(beta=0.1, seed=142):
 
 
 # ============ 3. Training/Eval =============
-def train_and_eval(beta=0.0, seed=42, total_timesteps=TOTAL_TIMESTEPS, eval_freq=EVAL_FREQ, eval_episodes=EVAL_EPISODES, n_envs=N_ENVS, round_idx=1):
+#def train_and_eval(beta, seed=42, total_timesteps=10_000, eval_freq=5_000, episodes=50, n_envs=8, writer=None):
+def train_and_eval(beta, seed=42, total_timesteps=2_000_000, eval_freq=50_000, episodes=50, n_envs=8, round_idx=1, writer=None):
     np.random.seed(seed)
     torch.manual_seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -108,7 +104,7 @@ def train_and_eval(beta=0.0, seed=42, total_timesteps=TOTAL_TIMESTEPS, eval_freq
 
         # Evaluation
         success_count, ep_env_rewards, ep_shaped_rewards, ep_lengths = 0, [], [], []
-        for _ in range(eval_episodes):
+        for _ in range(episodes):
             obs = eval_env.reset()
             if isinstance(obs, tuple): obs = obs[0]
             done, total_env_reward, total_shaped_reward, ep_len = False, 0, 0, 0
@@ -133,7 +129,7 @@ def train_and_eval(beta=0.0, seed=42, total_timesteps=TOTAL_TIMESTEPS, eval_freq
             ep_env_rewards.append(total_env_reward)
             ep_shaped_rewards.append(total_shaped_reward)
             ep_lengths.append(ep_len)
-        success_rate = success_count / eval_episodes * 100
+        success_rate = success_count / episodes * 100
         mean_env_reward = np.mean(ep_env_rewards)
         mean_total_reward = np.mean(ep_shaped_rewards)
         mean_ep_length = np.mean(ep_lengths)
@@ -146,15 +142,20 @@ def train_and_eval(beta=0.0, seed=42, total_timesteps=TOTAL_TIMESTEPS, eval_freq
             "mean_total_reward": mean_total_reward,
             "mean_length": mean_ep_length
         })
+        if writer is not None:
+            tag_prefix = f"Seed{seed}/Beta{beta:.5f}"
+            writer.add_scalar(f"{tag_prefix}/success_rate", success_rate, timesteps)
+            writer.add_scalar(f"{tag_prefix}/mean_env_reward", mean_env_reward, timesteps)
+            writer.add_scalar(f"{tag_prefix}/mean_shaped_reward", mean_total_reward, timesteps)
+            writer.add_scalar(f"{tag_prefix}/mean_length", mean_ep_length, timesteps)
 
 
         print(f"[β={beta:.5f} | seed={seed} | step {timesteps}] Success: {success_rate:.1f}% | EnvReward: {mean_env_reward:.2f} | ShapedReward: {mean_total_reward:.2f} | Length: {mean_ep_length:.1f}")
-        model_save_path = f"saved/ppo_doorkey_seed{seed}_round_{round_idx}_beta{beta:.5f}_sr{int(success_rate)}.zip"
-        model.save(model_save_path)
+    model_save_path = f"saved/ppo_doorkey_seed{seed}_round_{round_idx}_beta{beta:.5f}_sr{int(success_rate)}.zip"
+    model.save(model_save_path)
     return eval_results
 
-#def run_and_save(beta, seed=42, round_idx=0):
-def run_and_save(beta, seed=42, total_timesteps=2_000_000, eval_freq=50_000, eval_episodes=100, n_envs=8, round_idx=0):
+def run_and_save(beta, seed=42, round_idx=0, writer=None):
     import traceback
     try:
         torch.manual_seed(seed)
@@ -164,8 +165,7 @@ def run_and_save(beta, seed=42, total_timesteps=2_000_000, eval_freq=50_000, eva
         torch.cuda.manual_seed_all(seed)
         os.environ["PYTHONHASHSEED"] = str(seed)
         print(f"[WORKER] beta={beta:.5f}, seed={seed}, pid={os.getpid()}", flush=True)
-        
-        results = train_and_eval(beta=beta, seed=seed, total_timesteps=total_timesteps, eval_freq=eval_freq, eval_episodes=eval_episodes, n_envs=n_envs, round_idx=round_idx)
+        results = train_and_eval(beta, seed, round_idx, writer=writer)
         score = results[-1]["success_rate"]
         score_percent = score
         out_path = f"results/eval_seed{seed}_round{round_idx+1}_beta{beta:.5f}_sr{score_percent:.1f}.csv"
@@ -179,16 +179,16 @@ def run_and_save(beta, seed=42, total_timesteps=2_000_000, eval_freq=50_000, eva
             f.write(f"beta={beta}, seed={seed} round={round_idx+1} \nException: {e}\n")
             import traceback as tb
             f.write(tb.format_exc())
-    return results[-1]
-            
 
-def beta_search(seeds=[42], total_rounds=4, total_timesteps=TOTAL_TIMESTEPS, eval_freq=EVAL_FREQ, eval_episodes=EVAL_EPISODES, n_envs=N_ENVS, betas_per_round=10):
+
+
+def beta_search(total_rounds=4, betas_per_round=10, seeds=[42,43], writer=None):
     all_history = []
     beta_log_records = []
 
     for seed in seeds:
         print(f"\n🎯 Running for seed {seed}")
-        alpha , beta_param = 1, 1    # 
+        alpha , beta_param = 1, 1
         history = []
 
         for round_idx in range(total_rounds):
@@ -202,8 +202,9 @@ def beta_search(seeds=[42], total_rounds=4, total_timesteps=TOTAL_TIMESTEPS, eva
                 sampled_betas.append(0.0)  # baseline
                 
             sampled_betas = sorted(set(round(b, 5) for b in sampled_betas))  # keep precision to 5 digits
+           
             
-            mean_beta = np.mean(sampled_betas) # only for statistics 
+            mean_beta = np.mean(sampled_betas) # all Betas
             std_beta = np.std(sampled_betas)
             
             msg = (f"--- Round {round_idx+1} sampling: {sampled_betas} "
@@ -215,14 +216,7 @@ def beta_search(seeds=[42], total_rounds=4, total_timesteps=TOTAL_TIMESTEPS, eva
             results = []
             with mp.Pool(processes=len(sampled_betas)) as pool:
 
-                #rets = [pool.apply_async(run_and_save, (b, seed, round_idx)) for b in sampled_betas]
-                rets = [
-                    pool.apply_async(
-                        run_and_save,
-                        (b, seed, total_timesteps, eval_freq, eval_episodes, n_envs, round_idx)
-                    )
-                    for b in sampled_betas
-                ]
+                rets = [pool.apply_async(run_and_save, (b, seed, round_idx)) for b in sampled_betas]
                 for (b, r) in zip(sampled_betas, rets):
                     try:
                         r.get(timeout=3600*4)
@@ -243,6 +237,8 @@ def beta_search(seeds=[42], total_rounds=4, total_timesteps=TOTAL_TIMESTEPS, eva
                         results.append((seed, round_idx + 1, b, 0))
 
                         crash_tag = f"Seed{seed}/Round{round_idx+1}/crash_beta_{b:.5f}"
+                        if writer:
+                            writer.add_text(crash_tag, error_msg, round_idx)
             
             history.extend(results)
             
@@ -256,32 +252,37 @@ def beta_search(seeds=[42], total_rounds=4, total_timesteps=TOTAL_TIMESTEPS, eva
             scores = non_zero_rows["score"].to_numpy()
             betas = non_zero_rows["beta"].to_numpy()
             non_zero_scores_count = len(scores) 
-            zero_scores_count = len(df_hist) - non_zero_scores_count
+            zero_scores_count = len(df_hist) - non_zero_scores_count 
             
-
-            scores_norm = np.clip(scores / 100.0, 0, 1)  # Normalize to [0, 1]
-            
-            #if scores_norm.mean()>= SCORE_THRESH
-
-            alpha_update = scores_norm.sum() * eval_episodes
-            beta_update = (1 - scores_norm).sum() * eval_episodes + zero_scores_count * eval_episodes
-
-            alpha += alpha_update
-            beta_param += beta_update
-
-            mean_beta = alpha / (alpha + beta_param)
-            
-            msg = f"✅ [Round {round_idx+1}] Updated Beta({alpha:.2f}, {beta_param:.2f}) → mean β ≈ {mean_beta:.5f} | non-zero beta count={non_zero_scores_count}"
-            print(msg)
-            logging.info(msg)
+            if non_zero_scores_count > 0:
+                scores_norm = np.clip(scores / 100.0, 0, 1)  # Normalize to [0, 1]
                 
+                #alpha_update = scores_norm.sum()
+                beta_update = (1 - scores_norm).sum() + zero_scores_count
+
+                #alpha += alpha_update
+                beta_param += beta_update
+
+                mean_beta = alpha / (alpha + beta_param)
+
+                msg = f"✅ [Round {round_idx+1}] Updated Beta({alpha:.2f}, {beta_param:.2f}) → mean β ≈ {mean_beta:.5f} | non-zero beta count={non_zero_scores_count}"
+                print(msg)
+                logging.info(msg)
+            else:
+                beta_param += 1.0 
+                print(f"⚠️  [Round {round_idx+1}] All βs failed → shift posterior toward smaller β")
+                #mean_beta = 0.5 # fallback if no signal
+                #print(f"⚠️ [Round {round_idx+1}] All scores are zero, fallback to unweighted mean_beta: {mean_beta:.5f}")
+                
+            
+
             # 日志记录：每轮 beta 分布采样情况
             record = {
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "seed": seed,
                 "round": round_idx + 1,
                 "n_betas": len(sampled_betas),
-                "alpha_param":alpha,
+                "alpha":alpha,
                 "beta_param":beta_param,
                 "mean_beta_all": np.mean(sampled_betas),
                 "std_beta_all": np.std(sampled_betas),
@@ -309,16 +310,13 @@ def beta_search(seeds=[42], total_rounds=4, total_timesteps=TOTAL_TIMESTEPS, eva
 
 if __name__ == "__main__":
     
+    total_rounds = 4
     seeds=[42]
-    total_rounds = 5
-    betas_per_round = 10
-    
-    beta_search(
-        seeds=seeds,
-        total_rounds=total_rounds,
-        total_timesteps=TOTAL_TIMESTEPS,
-        eval_freq=EVAL_FREQ,
-        eval_episodes=EVAL_EPISODES,
-        betas_per_round = betas_per_round,
-        n_envs=N_ENVS
-    )
+
+    mp.set_start_method("spawn", force=True)
+    #ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    root_logdir = f"/root/tf-logs/"
+ 
+    writer = SummaryWriter(root_logdir)
+    beta_search(writer=writer, total_rounds=total_rounds, seeds=seeds)
+    writer.close()
