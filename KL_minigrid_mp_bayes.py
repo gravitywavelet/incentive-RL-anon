@@ -22,11 +22,16 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
+
+# TOTAL_TIMESTEPS = 20_000
+# EVAL_FREQ       = 10_000
 TOTAL_TIMESTEPS = 2_000_000
-EVAL_FREQ       = 50_000
+EVAL_FREQ       = 100_000
+
 EVAL_EPISODES   = 100
 N_ENVS          = 8
-SCORE_THRESH    = 0.5
+SCORE_THRESH    = 0.1
+MIN_BETA = 1e-5
 
 
 # =========== 1. KL-Reward Wrapper ==============
@@ -75,6 +80,115 @@ def make_eval_env(beta=0.1, seed=142):
         return env
     return thunk
 
+# ============ 2b. utility functions =============
+
+def extract_valid_candidates(results):
+    """
+    Filter (beta, normalized_score) from results with non-zero success rate.
+
+    Args:
+        results: list of tuples (seed, round, beta, score)
+
+    Returns:
+        List of tuples (beta, score_normalized_to_0_1)
+    """
+    return [(b, s / 100.0) for (_, _, b, s) in results if s > 0]
+
+
+def compute_beta_weights_linear(beta_scores):
+    """
+    Use raw normalized scores as linear weights (no softmax).
+    If all scores are zero, returns None, as this functions should not be called in this case.
+
+    Args:
+        beta_scores: list of (beta, normalized_score ∈ [0,1])
+
+    Returns:
+        list of (beta, weight), or None if empty
+    """
+    if not beta_scores:
+        print("⚠️ No successful beta this round — skip calc weights")
+        return None
+
+    scores = np.array([s for _, s in beta_scores])
+    betas = np.array([b for b, _ in beta_scores])
+
+    total_score = scores.sum()
+    if total_score == 0:
+        return None
+
+    weights = scores / total_score
+    return list(zip(betas, weights))
+
+def compute_weighted_mean_variance(beta_weight_pairs):
+    """
+    Computes the weighted mean and variance of β values.
+
+    Args:
+        beta_weight_pairs: list of (beta, weight)
+
+    Returns:
+        (mean_beta, var_beta)
+    """
+    betas = np.array([b for b, _ in beta_weight_pairs])
+    weights = np.array([w for _, w in beta_weight_pairs])
+
+    mean_beta = np.sum(weights * betas)
+    var_beta = np.sum(weights * (betas - mean_beta) ** 2)
+    var_beta = max(var_beta, 1e-6)  # numerical safeguard
+
+    return mean_beta, var_beta
+
+def moment_match_deltas(mean_beta, var_beta, alpha_old, beta_old):
+    """
+    Suggests how to shift (alpha, beta) using moment-matching.
+
+    Args:
+        mean_beta: weighted average of good β values
+        var_beta: weighted variance
+        alpha_old, beta_old: current Beta distribution parameters
+
+    Returns:
+        delta_alpha, delta_beta: how much to move (α, β) toward the new distribution
+    """
+    # Estimate target alpha and beta via moment-matching
+    common = (mean_beta * (1 - mean_beta)) / var_beta - 1
+    alpha_target = mean_beta * common
+    beta_target = (1 - mean_beta) * common
+
+    # Return the deltas (step toward the target)
+    delta_alpha = alpha_target - alpha_old
+    delta_beta = beta_target - beta_old
+
+    return delta_alpha, delta_beta
+
+def scale_concentration(alpha, beta_param, round_idx,
+                        min_conc=2.0, max_conc=100.0, growth=1.618):
+    """
+    Scales Beta(α, β) concentration to control exploration vs. exploitation.
+
+    Args:
+        alpha, beta_param: current Beta distribution parameters
+        round_idx: index of current round (0-based)
+        min_conc: base concentration (encourages exploration early)
+        max_conc: upper bound to avoid overfitting
+        growth: geometric rate of concentration tightening (e.g. golden ratio)
+
+    Returns:
+        (scaled_alpha, scaled_beta): adjusted parameters with controlled sharpness
+    """
+    # Compute target concentration for this round
+    target_conc = min_conc * (growth ** (round_idx+3))
+    target_conc = min(target_conc, max_conc)
+
+    # Current concentration level
+    current_conc = alpha + beta_param
+    scale = target_conc / current_conc
+    print(f"alpha:{alpha}, beta:{beta_param}, scale:{scale}")
+
+    return alpha * scale, beta_param * scale
+
+
 
 # ============ 3. Training/Eval =============
 def train_and_eval(beta=0.0, seed=42, total_timesteps=TOTAL_TIMESTEPS, eval_freq=EVAL_FREQ, eval_episodes=EVAL_EPISODES, n_envs=N_ENVS, round_idx=1):
@@ -108,6 +222,11 @@ def train_and_eval(beta=0.0, seed=42, total_timesteps=TOTAL_TIMESTEPS, eval_freq
 
         # Evaluation
         success_count, ep_env_rewards, ep_shaped_rewards, ep_lengths = 0, [], [], []
+        
+        if timesteps < TOTAL_TIMESTEPS / 2:
+            print(f"round:{round_idx+1} | beta:{beta} | Skipping eval at step {timesteps}")
+            continue
+            
         for _ in range(eval_episodes):
             obs = eval_env.reset()
             if isinstance(obs, tuple): obs = obs[0]
@@ -147,14 +266,13 @@ def train_and_eval(beta=0.0, seed=42, total_timesteps=TOTAL_TIMESTEPS, eval_freq
             "mean_length": mean_ep_length
         })
 
-
         print(f"[β={beta:.5f} | seed={seed} | step {timesteps}] Success: {success_rate:.1f}% | EnvReward: {mean_env_reward:.2f} | ShapedReward: {mean_total_reward:.2f} | Length: {mean_ep_length:.1f}")
-        model_save_path = f"saved/ppo_doorkey_seed{seed}_round_{round_idx}_beta{beta:.5f}_sr{int(success_rate)}.zip"
-        model.save(model_save_path)
+    model_save_path = f"saved/ppo_doorkey_seed{seed}_round_{round_idx+1}_beta{beta:.5f}_sr{int(success_rate)}.zip"
+    model.save(model_save_path)
     return eval_results
 
 #def run_and_save(beta, seed=42, round_idx=0):
-def run_and_save(beta, seed=42, total_timesteps=2_000_000, eval_freq=50_000, eval_episodes=100, n_envs=8, round_idx=0):
+def run_and_save(beta, seed=42, total_timesteps=2_000_000, eval_freq=50_000, eval_episodes=EVAL_EPISODES, n_envs=8, round_idx=0):
     import traceback
     try:
         torch.manual_seed(seed)
@@ -165,7 +283,7 @@ def run_and_save(beta, seed=42, total_timesteps=2_000_000, eval_freq=50_000, eva
         os.environ["PYTHONHASHSEED"] = str(seed)
         print(f"[WORKER] beta={beta:.5f}, seed={seed}, pid={os.getpid()}", flush=True)
         
-        results = train_and_eval(beta=beta, seed=seed, total_timesteps=total_timesteps, eval_freq=eval_freq, eval_episodes=eval_episodes, n_envs=n_envs, round_idx=round_idx)
+        results = train_and_eval(beta=beta, seed=seed, total_timesteps=total_timesteps, eval_freq=eval_freq, eval_episodes=EVAL_EPISODES, n_envs=n_envs, round_idx=round_idx)
         score = results[-1]["success_rate"]
         score_percent = score
         out_path = f"results/eval_seed{seed}_round{round_idx+1}_beta{beta:.5f}_sr{score_percent:.1f}.csv"
@@ -179,43 +297,41 @@ def run_and_save(beta, seed=42, total_timesteps=2_000_000, eval_freq=50_000, eva
             f.write(f"beta={beta}, seed={seed} round={round_idx+1} \nException: {e}\n")
             import traceback as tb
             f.write(tb.format_exc())
-    return results[-1]
+    return True #as running in parralel
             
 
-def beta_search(seeds=[42], total_rounds=4, total_timesteps=TOTAL_TIMESTEPS, eval_freq=EVAL_FREQ, eval_episodes=EVAL_EPISODES, n_envs=N_ENVS, betas_per_round=10):
+def beta_search(
+    seeds=[42, 47, 101],
+    total_rounds=5,
+    total_timesteps=TOTAL_TIMESTEPS,
+    eval_freq=EVAL_FREQ,
+    eval_episodes=EVAL_EPISODES,
+    n_envs=N_ENVS,
+    betas_per_round=10
+):
     all_history = []
     beta_log_records = []
 
-    for seed in seeds:
-        print(f"\n🎯 Running for seed {seed}")
-        alpha , beta_param = 1, 1    # 
-        history = []
+    alpha, beta_param = 1, 1   # shared posterior across all seeds
 
-        for round_idx in range(total_rounds):
-            start_time = datetime.now()
-            print(f"\n⏱️ [Seed {seed} | Round {round_idx+1}] Start at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-           
-            rng = np.random.default_rng(seed * 100 + round_idx)  # 防冲突，可调
-            sampled_betas = list(beta_dist(alpha , beta_param).rvs(betas_per_round, random_state=rng))
-            #sampled_betas = list(beta_dist(alpha, beta_param).rvs(betas_per_round, random_state=rng) * 0.2)
-            if round_idx == total_rounds - 1:
-                sampled_betas.append(0.0)  # baseline
-                
-            sampled_betas = sorted(set(round(b, 5) for b in sampled_betas))  # keep precision to 5 digits
-            
-            mean_beta = np.mean(sampled_betas) # only for statistics 
-            std_beta = np.std(sampled_betas)
-            
-            msg = (f"--- Round {round_idx+1} sampling: {sampled_betas} "
-                   f"(n={len(sampled_betas)}, mean={mean_beta:.5f}, std={std_beta:.5f}) ---")
-            print(msg)
-            logging.info(msg)
-            
+    for round_idx in range(total_rounds):
+        start_time = datetime.now()
+        print(f"\n⏱️ [Round {round_idx+1}] Start at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
+        rng = np.random.default_rng(999 + round_idx)  # global RNG, independent of seed
+        sampled_betas = list(beta_dist(alpha, beta_param).rvs(betas_per_round, random_state=rng))
+        if round_idx == total_rounds - 1:
+            sampled_betas.append(0.0)  # baseline
+
+        sampled_betas = sorted(round(b, 5) for b in sampled_betas)
+        sampled_betas = np.clip(sampled_betas, MIN_BETA, 1.0)
+        print(f"--- Round {round_idx+1} sampling: {sampled_betas} ---")
+
+        # run all (seed, beta) pairs
+        round_results = []
+        for seed in seeds:
             results = []
             with mp.Pool(processes=len(sampled_betas)) as pool:
-
-                #rets = [pool.apply_async(run_and_save, (b, seed, round_idx)) for b in sampled_betas]
                 rets = [
                     pool.apply_async(
                         run_and_save,
@@ -226,90 +342,72 @@ def beta_search(seeds=[42], total_rounds=4, total_timesteps=TOTAL_TIMESTEPS, eva
                 for (b, r) in zip(sampled_betas, rets):
                     try:
                         r.get(timeout=3600*4)
-                        
                         matches = list(Path("results").glob(f"eval_seed{seed}_round*_beta{b:.5f}_sr*.csv"))
                         if matches:
                             df = pd.read_csv(matches[0])
                             score = df.iloc[-1].get("success_rate", 0)
                         else:
-                            print(f"❗ No result file found for beta={b:.5f}, seed={seed}")
                             score = 0
-                        results.append((seed, round_idx + 1, b, score))   # (42,1,0.012,86.0)
- 
-
+                        results.append((seed, round_idx+1, b, score))
                     except Exception as e:
-                        error_msg = f"⚠️ A worker crashed for beta={b:.5f}, error: {str(e)}"
-                        print(error_msg)
-                        results.append((seed, round_idx + 1, b, 0))
+                        print(f"⚠️ Worker crashed for beta={b:.5f}, seed={seed}, err={e}")
+                        results.append((seed, round_idx+1, b, 0))
+            round_results.extend(results)
 
-                        crash_tag = f"Seed{seed}/Round{round_idx+1}/crash_beta_{b:.5f}"
-            
-            history.extend(results)
-            
+        # aggregate across seeds before updating posterior
+        history_df = pd.DataFrame(round_results, columns=["seed", "round", "beta", "score"])
+        all_history.extend(round_results)
 
-            # Update Beta distribution
-            df_hist = pd.DataFrame(results, columns=["seed", "round", "beta", "score"])
-            print(f"df_hist:{df_hist}")
-            
-            non_zero_rows = df_hist[df_hist["score"] > 1e-6]
-            
-            scores = non_zero_rows["score"].to_numpy()
-            betas = non_zero_rows["beta"].to_numpy()
-            non_zero_scores_count = len(scores) 
-            zero_scores_count = len(df_hist) - non_zero_scores_count
-            
+        candidates = extract_valid_candidates(round_results)
+        print(f"candidates:{candidates}, count={len(candidates)}")
 
-            scores_norm = np.clip(scores / 100.0, 0, 1)  # Normalize to [0, 1]
-            
-            #if scores_norm.mean()>= SCORE_THRESH
+        beta_weight_pairs = compute_beta_weights_linear(candidates)
+        if beta_weight_pairs is None:
+            delta_alpha, delta_beta = 0, 10
+        else:
+            mean_beta, var_beta = compute_weighted_mean_variance(beta_weight_pairs)
+            delta_alpha, delta_beta = moment_match_deltas(mean_beta, var_beta, alpha, beta_param)
 
-            alpha_update = scores_norm.sum() * eval_episodes
-            beta_update = (1 - scores_norm).sum() * eval_episodes + zero_scores_count * eval_episodes
+        alpha += delta_alpha
+        beta_param += delta_beta
+        alpha, beta_param = scale_concentration(alpha, beta_param, round_idx)
 
-            alpha += alpha_update
-            beta_param += beta_update
+        mean_beta_post = alpha / (alpha + beta_param)
+        msg = f"✅ [Round {round_idx+1} End] Updated Beta({alpha:.2f}, {beta_param:.2f}) → mean β ≈ {mean_beta_post:.5f}"
+        print(msg)
+        logging.info(msg)
 
-            mean_beta = alpha / (alpha + beta_param)
-            
-            msg = f"✅ [Round {round_idx+1}] Updated Beta({alpha:.2f}, {beta_param:.2f}) → mean β ≈ {mean_beta:.5f} | non-zero beta count={non_zero_scores_count}"
-            print(msg)
-            logging.info(msg)
-                
-            # 日志记录：每轮 beta 分布采样情况
-            record = {
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "seed": seed,
-                "round": round_idx + 1,
-                "n_betas": len(sampled_betas),
-                "alpha_param":alpha,
-                "beta_param":beta_param,
-                "mean_beta_all": np.mean(sampled_betas),
-                "std_beta_all": np.std(sampled_betas),
-                "min_beta": min(sampled_betas),
-                "max_beta": max(sampled_betas),
-                "betas": sampled_betas,
-            }
-            beta_log_records.append(record)
+        # log summary per round
+        record = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "round": round_idx+1,
+            "n_betas": len(sampled_betas),
+            "alpha_param": alpha,
+            "beta_param": beta_param,
+            "mean_beta_all": np.mean(sampled_betas),
+            "std_beta_all": np.std(sampled_betas),
+            "min_beta": min(sampled_betas),
+            "max_beta": max(sampled_betas),
+            "betas": sampled_betas,
+        }
+        beta_log_records.append(record)
+        csv_path = "results/beta_log_summary_all.csv"
+        pd.DataFrame([record]).to_csv(
+            csv_path,
+            mode="a",
+            header=not Path(csv_path).exists(),
+            index=False
+        )
 
-            # 写入统一日志文件 per round
-            csv_path = "results/beta_log_summary_all.csv"
-            df_curr = pd.DataFrame([record])
-            df_curr.to_csv(
-                csv_path,
-                mode="a",  # 追加模式
-                header=not Path(csv_path).exists(),  # 如果文件不存在则写 header
-                index=False
-            )
-
-        all_history.extend(history)
-
-    pd.DataFrame(all_history).to_csv("results/beta_search_history_all.csv", index=False)
-    print("✅ Multi-seed Bayesian beta search finished!")
+    pd.DataFrame(all_history, columns=["seed","round","beta","score"]).to_csv(
+        "results/beta_search_history_all.csv", index=False
+    )
+    print("✅ Round-major multi-seed Bayesian beta search finished!")
 
 
 if __name__ == "__main__":
     
-    seeds=[42]
+    seeds=[42, 47, 101]
     total_rounds = 5
     betas_per_round = 10
     
