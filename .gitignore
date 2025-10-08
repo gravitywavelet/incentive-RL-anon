@@ -5,5 +5,5 @@ results/
 __pycache__/
 .ipynb_checkpoints/
 klrr_env/
-*Copy*.py
+KL_minigrid_mp_bayes-Copy1.py
 *.log

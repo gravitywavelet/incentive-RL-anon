@@ -17,25 +17,26 @@ The framework combines:
 - **Bayesian adaptation** of the incentive weight $\beta$ using an online posterior update mechanism
 
 ---
-
 ## 🧩 Key Idea
 
 Traditional RL agents optimize for external rewards, often struggling in sparse or delayed-reward settings.  
-IncentRL adds an **internal alignment term** inspired by cognitive dissonance and predictive coding:
+**IncentRL** adds an **internal alignment term** inspired by cognitive dissonance and predictive coding:
 
-\[
+$$
 \mathcal{L}_{\text{IncentRL}} = -\mathbb{E}_{(s,a)\sim \pi}\Big[ r_{\text{ext}}(s,a) - \beta \, D_{KL}(p(o|s,a)\,\|\,q(o|s)) \Big]
-\]
+$$
 
 where:
+
 - \( p(o|s,a) \): predicted outcome distribution  
 - \( q(o|s) \): preferred outcome distribution  
-- \( \beta \sim \text{Beta}(\alpha, \gamma) \): dynamically sampled incentive weight updated via Bayesian posterior
+- \( \beta \sim \text{Beta}(\alpha, \gamma) \): dynamically sampled incentive weight updated via Bayesian posterior  
 
 This forms an **adaptive incentive shaping** mechanism that bridges:
+
 - Exploration–exploitation trade-offs  
 - Extrinsic–intrinsic reward unification  
-- Cognitive–computational symmetry (dopamine RPE ↔ Bayesian belief updating)
+- Cognitive–computational symmetry *(dopamine RPE ↔ Bayesian belief updating)*
 
 ---
 
