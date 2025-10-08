@@ -28,9 +28,9 @@ $$
 
 where:
 
-- \( p(o|s,a) \): predicted outcome distribution  
-- \( q(o|s) \): preferred outcome distribution  
-- \( \beta \sim \text{Beta}(\alpha, \gamma) \): dynamically sampled incentive weight updated via Bayesian posterior  
+- $$\( p(o|s,a) \)$$: predicted outcome distribution  
+- $$\( q(o|s) \$$): preferred outcome distribution  
+- $$\( \beta \sim \text{Beta}(\alpha, \gamma) \)$$: dynamically sampled incentive weight updated via Bayesian posterior  
 
 This forms an **adaptive incentive shaping** mechanism that bridges:
 
